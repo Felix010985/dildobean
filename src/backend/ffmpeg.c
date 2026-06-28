@@ -44,6 +44,7 @@ void run_ffmpeg_backend(const char *input_file, const char *output_file, const B
 
     int status = _spawnlp(0, "ffmpeg", "ffmpeg",
                       "-loglevel", "quiet",
+                      "-nostdin",
                       "-stats",
                       "-i", input_file,
                       "-vf", filter,
