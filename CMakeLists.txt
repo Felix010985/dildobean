@@ -15,3 +15,7 @@ add_executable(dildobean ${SOURCES})
 if(WIN32)
     target_link_options(dildobean PRIVATE -mconsole)
 endif()
+if(UNIX OR ANDROID)
+    target_link_libraries(dildobean PRIVATE m)
+endif()
+
