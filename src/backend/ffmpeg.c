@@ -43,17 +43,19 @@ void run_ffmpeg_backend(const char *input_file, const char *output_file, const B
     printf("filter config: %s\n", filter);
 
     int status = _spawnlp(0, "ffmpeg", "ffmpeg",
-                          "-i", input_file,
-                          "-vf", filter,
-                          "-c:a", "copy",
-                          "-c:v", preset->encoder,
-                          preset->bitrate,
-                          "-y", output_file,
-                          NULL);
+                      "-loglevel", "quiet",
+                      "-stats",
+                      "-i", input_file,
+                      "-vf", filter,
+                      "-c:a", "copy",
+                      "-c:v", preset->encoder,
+                      preset->bitrate,
+                      "-y", output_file,
+                      NULL);
 
     if (status == 0) {
-        printf("ffmpeg rendering finished successfully.\n");
+        printf("\nffmpeg rendering finished successfully.\n");
     } else {
-        printf("error: ffmpeg pipeline returned status %d.\n", status);
+        printf("\nerror: ffmpeg pipeline returned status %d.\n", status);
     }
 }
