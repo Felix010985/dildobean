@@ -1,0 +1,14 @@
+.idea/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+*.exe
+*.o
+*.obj
+*.dll
+*.a
+*.so
+priority.ini
+# presets/*_fixed.ini
