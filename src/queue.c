@@ -15,6 +15,32 @@
 #define clr_red     "\033[31m"
 #define clr_gray    "\033[90m"
 
+typedef enum { TYPE_STR, TYPE_INT } ParamType;
+
+typedef struct {
+    const char *key;
+    ParamType type;
+    size_t offset;
+    size_t size;
+    const char *def_str;
+    int def_int;
+    int min_val;
+    int max_val;
+} IniFieldMeta;
+
+static const IniFieldMeta preset_meta[] = {
+    {"name",       TYPE_STR, offsetof(BlurPreset, name),       sizeof(((BlurPreset*)0)->name),       "default", 0, 0, 0},
+    {"backend",    TYPE_STR, offsetof(BlurPreset, backend),    sizeof(((BlurPreset*)0)->backend),    "ffmpeg",                0, 0, 0},
+    {"blur_mode",  TYPE_STR, offsetof(BlurPreset, blur_mode),   sizeof(((BlurPreset*)0)->blur_mode),   "gaussian",              0, 0, 0},
+    {"output_fps", TYPE_STR, offsetof(BlurPreset, output_fps),  sizeof(((BlurPreset*)0)->output_fps),  "60",                    0, 0, 0},
+    {"encoder",    TYPE_STR, offsetof(BlurPreset, encoder),     sizeof(((BlurPreset*)0)->encoder),     "libx264",               0, 0, 0},
+    {"bitrate",    TYPE_STR, offsetof(BlurPreset, bitrate),     sizeof(((BlurPreset*)0)->bitrate),     "-crf 14",               0, 0, 0},
+    {"frames",     TYPE_INT, offsetof(BlurPreset, frames),     0,                                    NULL,                    7, 1, 512},
+    {"quality",    TYPE_INT, offsetof(BlurPreset, quality),    0,                                    NULL,                    14, 0, 51}
+};
+#define META_COUNT (sizeof(preset_meta) / sizeof(preset_meta[0]))
+
+
 static void trim_whitespace(char *str) {
     size_t len = strlen(str);
     while (len > 0 && (str[len - 1] == '\n' || str[len - 1] == '\r' || str[len - 1] == ' ' || str[len - 1] == '\t')) {
@@ -27,9 +53,242 @@ static void clear_screen(void) {
     printf("\033[H\033[J");
 }
 
+int validate_preset_structure(BlurPreset *preset) {
+    int was_corrupted = 0;
+
+    for (size_t i = 0; i < META_COUNT; i++) {
+        const IniFieldMeta *meta = &preset_meta[i];
+
+        if (meta->type == TYPE_STR) {
+            char *field_ptr = (char*)((char*)preset + meta->offset);
+            if (strlen(field_ptr) == 0) {
+                printf("warning: missing '%s', using fallback '%s'\n", meta->key, meta->def_str);
+                snprintf(field_ptr, meta->size, "%s", meta->def_str);
+                was_corrupted = 1;
+            }
+        } else if (meta->type == TYPE_INT) {
+            int *field_ptr = (int*)((char*)preset + meta->offset);
+            if (*field_ptr < meta->min_val || *field_ptr > meta->max_val) {
+                printf("warning: invalid range for '%s', using fallback %d\n", meta->key, meta->def_int);
+                *field_ptr = meta->def_int;
+                was_corrupted = 1;
+            }
+        }
+    }
+    return was_corrupted;
+}
+
+void patch_corrupted_lines(const char *preset_file, BlurPreset *preset) {
+    FILE *fr = fopen(preset_file, "r");
+    if (!fr) return;
+
+    char *file_buffer = calloc(1, 16384);
+    if (!file_buffer) {
+        fclose(fr);
+        return;
+    }
+
+    char line[256];
+    int found_flags[META_COUNT] = {0};
+
+    while (fgets(line, sizeof(line), fr)) {
+        char *start = line;
+        while (*start == ' ' || *start == '\t') start++;
+
+        if (start[0] == '#' || start[0] == ';' || start[0] == '\n' || start[0] == '\r' || start[0] == '[') {
+            strncat(file_buffer, line, 16384 - strlen(file_buffer) - 1);
+            continue;
+        }
+
+        char *eq = strchr(start, '=');
+        if (!eq) {
+            continue;
+        }
+
+        int line_patched = 0;
+        for (size_t i = 0; i < META_COUNT; i++) {
+            const IniFieldMeta *meta = &preset_meta[i];
+            size_t key_len = strlen(meta->key);
+
+            if (strncmp(start, meta->key, key_len) == 0 && start[key_len] == '=') {
+                char patch_buf[256];
+                int spaces = start - line;
+
+                int offset = 0;
+                for (int s = 0; s < spaces; s++) {
+                    patch_buf[offset++] = line[s];
+                }
+
+                if (meta->type == TYPE_STR) {
+                    snprintf(patch_buf + offset, sizeof(patch_buf) - offset, "%s=%s\n", meta->key, (char*)((char*)preset + meta->offset));
+                } else {
+                    snprintf(patch_buf + offset, sizeof(patch_buf) - offset, "%s=%d\n", meta->key, *(int*)((char*)preset + meta->offset));
+                }
+
+                strncat(file_buffer, patch_buf, 16384 - strlen(file_buffer) - 1);
+                found_flags[i] = 1;
+                line_patched = 1;
+                break;
+            }
+        }
+
+        if (!line_patched) {
+            strncat(file_buffer, line, 16384 - strlen(file_buffer) - 1);
+        }
+    }
+    fclose(fr);
+
+    for (size_t i = 0; i < META_COUNT; i++) {
+        if (!found_flags[i]) {
+            const IniFieldMeta *meta = &preset_meta[i];
+            char append_buf[256];
+            if (meta->type == TYPE_STR) {
+                snprintf(append_buf, sizeof(append_buf), "%s=%s\n", meta->key, (char*)((char*)preset + meta->offset));
+            } else {
+                snprintf(append_buf, sizeof(append_buf), "%s=%d\n", meta->key, *(int*)((char*)preset + meta->offset));
+            }
+            strncat(file_buffer, append_buf, 16384 - strlen(file_buffer) - 1);
+        }
+    }
+
+    FILE *fw = fopen(preset_file, "w");
+    if (fw) {
+        fputs(file_buffer, fw);
+        fclose(fw);
+    }
+
+    free(file_buffer);
+}
+
+// static int has_unknown_keys(const char *preset_file) {
+//     FILE *f = fopen(preset_file, "r");
+//     if (!f) return 0;
+//
+//     char line[256];
+//     int found_unknown = 0;
+//
+//     while (fgets(line, sizeof(line), f)) {
+//         char *start = line;
+//         while (*start == ' ' || *start == '\t') start++;
+//
+//         if (*start == '#' || *start == ';' || *start == '\n' || *start == '\r' || *start == '[') {
+//             continue;
+//         }
+//
+//         char *eq = strchr(start, '=');
+//         if (!eq) {
+//             found_unknown = 1;
+//             break;
+//         }
+//
+//         size_t key_len = eq - start;
+//
+//         int is_valid_key = 0;
+//         for (size_t i = 0; i < META_COUNT; i++) {
+//             if (strncmp(start, preset_meta[i].key, key_len) == 0 && strlen(preset_meta[i].key) == key_len) {
+//                 is_valid_key = 1;
+//                 break;
+//             }
+//         }
+//
+//         if (!is_valid_key) {
+//             found_unknown = 1;
+//             break;
+//         }
+//     }
+//
+//     fclose(f);
+//     return found_unknown;
+// }
+
+int is_encoder_supported(const char *encoder_name) {
+    if (strlen(encoder_name) == 0) return 0;
+    FILE *fp = popen("ffmpeg -encoders -loglevel quiet", "r");
+    if (!fp) return 0;
+
+    char line[256];
+    int found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, encoder_name) != NULL) {
+            found = 1;
+            break;
+        }
+    }
+    pclose(fp);
+    return found;
+}
+
+int has_unknown_keys(const char *preset_file) {
+    FILE *f = fopen(preset_file, "r");
+    if (!f) return 0;
+
+    char line[256];
+    int found_unknown = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        char *start = line;
+        while (*start == ' ' || *start == '\t') start++;
+
+        if (*start == '#' || *start == ';' || *start == '\n' || *start == '\r' || *start == '[') {
+            continue;
+        }
+
+        char *eq = strchr(start, '=');
+        if (!eq) {
+            found_unknown = 1;
+            break;
+        }
+
+        size_t key_len = eq - start;
+        int is_valid_key = 0;
+        for (size_t i = 0; i < META_COUNT; i++) {
+            if (strncmp(start, preset_meta[i].key, key_len) == 0 && strlen(preset_meta[i].key) == key_len) {
+                is_valid_key = 1;
+                break;
+            }
+        }
+
+        if (!is_valid_key) {
+            found_unknown = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return found_unknown;
+}
+PresetStatus check_preset_health(const char *preset_filepath, BlurPreset *preset) {
+    if (strcmp(preset->backend, "ffmpeg") == 0) {
+        if (!is_encoder_supported(preset->encoder)) return STATUS_ERROR;
+    }
+    if (strlen(preset->backend) == 0 || (strcmp(preset->backend, "ffmpeg") != 0 && strcmp(preset->backend, "dildoengine") != 0)) {
+        return STATUS_ERROR;
+    }
+
+    if (has_unknown_keys(preset_filepath)) {
+        return STATUS_WARNING;
+    }
+
+    int fps_val = atoi(preset->output_fps);
+    if (fps_val < 24 || fps_val > 240 || preset->frames < 2 || preset->frames > 32) {
+        return STATUS_WARNING;
+    }
+
+    return STATUS_OK;
+}
+
+void show_critical_error_window(const char *error_title, const char *error_message) {
+    clear_screen();
+    printf("%s|--------------------------------------------------------|%s\n", clr_red, clr_reset);
+    printf("%s| %-54s |%s\n", clr_red, error_title, clr_reset);
+    printf("%s|--------------------------------------------------------|%s\n\n", clr_red, clr_reset);
+    printf("  %sDetail:%s %s\n\n", clr_bold, clr_reset, error_message);
+    printf("%s  [ Press any key to return to profile selection ]%s\n", clr_gray, clr_reset);
+    getch();
+}
+
 void show_preset_code_preview(const char *preset_name, const char *preset_filepath) {
     clear_screen();
-    printf("name: %s\n", preset_name);
+    printf("display name: %s\n", preset_name);
     printf("path: %s\n", preset_filepath);
     printf("--------------------------------------------------\n");
 
@@ -49,7 +308,7 @@ void show_preset_code_preview(const char *preset_name, const char *preset_filepa
 
     while (1) {
         char action = getch();
-        if (action == 2) { // ^b (ctrl+b) - go back to core selection menu.
+        if (action == 2) {
             break;
         }
         if (action == 13) { // ^m (ctrl+m / enter) - spawn system editor.
@@ -113,8 +372,17 @@ void get_preset_from_priority_menu(char *out_filename, size_t max_len) {
             strcpy(names[count], key);
             strcpy(paths[count], val);
 
-            // display clear human-readable preset names instead of raw paths.
-            printf("%d. %s\n", count + 1, names[count]);
+            BlurPreset test_preset = {0};
+            load_and_validate_preset(paths[count], &test_preset);
+            PresetStatus health = check_preset_health(paths[count], &test_preset);
+
+            if (health == STATUS_ERROR) {
+                printf("%s%d. %s [CRITICAL ERROR]%s\n", clr_red, count + 1, names[count], clr_reset);
+            } else if (health == STATUS_WARNING) {
+                printf("%s%d. %s [MODIFIED/WARN]%s\n", clr_yellow, count + 1, names[count], clr_reset);
+            } else {
+                printf("%s%d. %s%s\n", clr_bold, count + 1, names[count], clr_reset);
+            }
             count++;
         }
     }
@@ -122,6 +390,7 @@ void get_preset_from_priority_menu(char *out_filename, size_t max_len) {
 
     if (count == 0) {
         printf("error: priority queue playlist is empty.\n");
+        free(names); free(paths);
         exit(1);
     }
 
@@ -138,11 +407,9 @@ void get_preset_from_priority_menu(char *out_filename, size_t max_len) {
             show_preset_code_preview(names[p_idx], paths[p_idx]);
         }
 
-        // clean up temporary dynamic memory before recursion loop.
         for (int i = 0; i < count; i++) { free(names[i]); free(paths[i]); }
         free(names); free(paths);
 
-        // loop back into menu to pick the file for execution.
         get_preset_from_priority_menu(out_filename, max_len);
         return;
     }
@@ -151,6 +418,26 @@ void get_preset_from_priority_menu(char *out_filename, size_t max_len) {
     if (idx < 0 || idx >= count) {
         printf("\ninvalid selection. using highest priority index.\n");
         idx = 0;
+    }
+
+    BlurPreset final_check = {0};
+    load_and_validate_preset(paths[idx], &final_check);
+    PresetStatus run_status = check_preset_health(paths[idx], &final_check);
+
+    if (run_status == STATUS_ERROR || has_unknown_keys(paths[idx])) {
+        if (has_unknown_keys(paths[idx])) {
+            show_critical_error_window("CONFIG CORRUPTION ERROR", "Found unexpected or malformed layout keys (like 'fggkk...='). Please clean up the file.");
+        } else {
+            char err_buf[256];
+            snprintf(err_buf, sizeof(err_buf), "Target encoder '%s' or backend '%s' is invalid/unsupported.", final_check.encoder, final_check.backend);
+            show_critical_error_window("INVALID PIPELINE CONFIG", err_buf);
+        }
+
+        for (int i = 0; i < count; i++) { free(names[i]); free(paths[i]); }
+        free(names); free(paths);
+
+        get_preset_from_priority_menu(out_filename, max_len);
+        return;
     }
 
     // safely export the exact absolute target file path to core launcher.
@@ -162,67 +449,74 @@ void get_preset_from_priority_menu(char *out_filename, size_t max_len) {
     free(names); free(paths);
 }
 
+// void apply_preset_fallbacks(const char *preset_file, BlurPreset *preset) {
+//     int was_corrupted = 0;
+//
+//     if (strlen(preset->name) == 0) {
+//         strcpy(preset->name, "custom dynamic preset");
+//         was_corrupted = 1;
+//     }
+//
+//     if (strlen(preset->backend) == 0) {
+//         printf("warning: backend configuration missing. falling back to ffmpeg engine.\n");
+//         strcpy(preset->backend, "ffmpeg");
+//         was_corrupted = 1;
+//     }
+//
+//     if (strlen(preset->blur_mode) == 0) {
+//         printf("warning: blur mode configuration missing. falling back to gaussian logic.\n");
+//         strcpy(preset->blur_mode, "gaussian");
+//         was_corrupted = 1;
+//     }
+//
+//     if (preset->frames < 1 || preset->frames > 512) {
+//         printf("warning: invalid frames range configuration. falling back to default 7 frames.\n");
+//         preset->frames = 7;
+//         was_corrupted = 1;
+//     }
+//
+//     if (strlen(preset->output_fps) == 0) {
+//         printf("warning: target output fps configuration missing. falling back to 60 frames.\n");
+//         strcpy(preset->output_fps, "60");
+//         was_corrupted = 1;
+//     }
+//
+//     if (strlen(preset->encoder) == 0) {
+//         printf("warning: video encoder configuration missing. falling back to safe libx264 codec.\n");
+//         strcpy(preset->encoder, "libx264");
+//         was_corrupted = 1;
+//     }
+//
+//     if (strlen(preset->bitrate) == 0) {
+//         printf("warning: bitrate flags missing. falling back to crf 14 execution.\n");
+//         strcpy(preset->bitrate, "-crf 14");
+//         was_corrupted = 1;
+//     }
+//
+//     if (was_corrupted) {
+//         printf("fixing and overwriting corrupted preset file.\n");
+//         FILE *fw = fopen(preset_file, "w");
+//         if (fw) {
+//             fprintf(fw, "# fixed automatically by dildobean.\n\n");
+//             fprintf(fw, "[preset]\n");
+//             fprintf(fw, "name=%s\n", preset->name);
+//             fprintf(fw, "backend=%s\n", preset->backend);
+//             fprintf(fw, "frames=%d\n", preset->frames);
+//             fprintf(fw, "blur_mode=%s\n", preset->blur_mode);
+//             fprintf(fw, "output_fps=%s\n", preset->output_fps);
+//             fprintf(fw, "encoder=%s\n", preset->encoder);
+//             fprintf(fw, "bitrate=%s\n", preset->bitrate);
+//             fclose(fw);
+//         } else {
+//             printf("warning: cannot overwrite template asset file.\n");
+//         }
+//     }
+// }
+
 void apply_preset_fallbacks(const char *preset_file, BlurPreset *preset) {
-    int was_corrupted = 0;
-
-    if (strlen(preset->name) == 0) {
-        strcpy(preset->name, "custom dynamic preset");
-        was_corrupted = 1;
-    }
-
-    if (strlen(preset->backend) == 0) {
-        printf("warning: backend configuration missing. falling back to ffmpeg engine.\n");
-        strcpy(preset->backend, "ffmpeg");
-        was_corrupted = 1;
-    }
-
-    if (strlen(preset->blur_mode) == 0) {
-        printf("warning: blur mode configuration missing. falling back to gaussian logic.\n");
-        strcpy(preset->blur_mode, "gaussian");
-        was_corrupted = 1;
-    }
-
-    if (preset->frames < 1 || preset->frames > 512) {
-        printf("warning: invalid frames range configuration. falling back to default 7 frames.\n");
-        preset->frames = 7;
-        was_corrupted = 1;
-    }
-
-    if (strlen(preset->output_fps) == 0) {
-        printf("warning: target output fps configuration missing. falling back to 60 frames.\n");
-        strcpy(preset->output_fps, "60");
-        was_corrupted = 1;
-    }
-
-    if (strlen(preset->encoder) == 0) {
-        printf("warning: video encoder configuration missing. falling back to safe libx264 codec.\n");
-        strcpy(preset->encoder, "libx264");
-        was_corrupted = 1;
-    }
-
-    if (strlen(preset->bitrate) == 0) {
-        printf("warning: bitrate flags missing. falling back to crf 14 execution.\n");
-        strcpy(preset->bitrate, "-crf 14");
-        was_corrupted = 1;
-    }
-
-    if (was_corrupted) {
-        printf("fixing and overwriting corrupted preset file.\n");
-        FILE *fw = fopen(preset_file, "w");
-        if (fw) {
-            fprintf(fw, "# fixed automatically by dildobean.\n\n");
-            fprintf(fw, "[preset]\n");
-            fprintf(fw, "name=%s\n", preset->name);
-            fprintf(fw, "backend=%s\n", preset->backend);
-            fprintf(fw, "frames=%d\n", preset->frames);
-            fprintf(fw, "blur_mode=%s\n", preset->blur_mode);
-            fprintf(fw, "output_fps=%s\n", preset->output_fps);
-            fprintf(fw, "encoder=%s\n", preset->encoder);
-            fprintf(fw, "bitrate=%s\n", preset->bitrate);
-            fclose(fw);
-        } else {
-            printf("warning: cannot overwrite template asset file.\n");
-        }
+    if (validate_preset_structure(preset)) {
+        printf("fixing and overwriting corrupted line(s) on disk...\n");
+        patch_corrupted_lines(preset_file, preset);
     }
 }
 

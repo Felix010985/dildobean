@@ -22,6 +22,8 @@ int main(int argc, char *argv[]) {
     BlurPreset preset;
     load_and_validate_preset(preset_filename, &preset);
 
+    apply_preset_fallbacks(preset_filename, &preset);
+
     char output_filename[1024];
     strncpy(output_filename, input_filename, sizeof(output_filename) - 1);
     output_filename[sizeof(output_filename) - 1] = '\0';
